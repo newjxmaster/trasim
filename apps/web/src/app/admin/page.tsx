@@ -24,6 +24,9 @@ export default function AdminDashboard() {
               <p className="text-gray-400 mb-4">
                 Wallet: {publicKey?.toString()}
               </p>
+              <p className="text-sm text-gray-500 mb-2">
+                Expected admin: PFdmrD8R0RyJIDJr1j9q6jAbv67Xdd1dt8tx3fee02am
+              </p>
               <button
                 onClick={() => setIsAdmin(true)}
                 className="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg font-semibold"

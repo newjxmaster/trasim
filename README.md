@@ -32,6 +32,9 @@ psql postgres://localhost:5432/trasim -f packages/db/migrations/001_initial.sql
 # Setup environment variables
 cp .env.example .env
 # Edit .env with your RPC URL, database connection, etc.
+
+# Important: The admin wallet must match the one that initializes the config
+ADMIN_WALLET=PFdmrD8R0RyJIDJr1j9q6jAbv67Xdd1dt8tx3fee02am
 ```
 
 ## Development
@@ -61,6 +64,21 @@ anchor deploy
 
 # Deploy to devnet/mainnet
 anchor deploy --provider.cluster devnet
+```
+
+### Initial Setup
+
+After deploying, initialize the config with your admin wallet:
+
+```bash
+anchor test -- --skip-local-validator
+# Or create a script to call initialize_config
+```
+
+The admin wallet (PFdmrD8R0RyJIDJr1j9q6jAbv67Xdd1dt8tx3fee02am) will:
+- Create GlobalConfig PDA
+- Set default parameters (caps, fees, cooldown)
+- Have full control over seasons, treasury withdrawals
 ```
 
 ### Program IDs

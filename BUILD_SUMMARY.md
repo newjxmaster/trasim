@@ -2,7 +2,16 @@
 
 ## Project Status: Initial Structure Complete ✅
 
-Built a complete full-stack Solana market simulation game following the specifications from the whitepaper and architecture documents.
+Built a complete full-stack Solana market simulation game following specifications from whitepaper and architecture documents.
+
+### Admin Wallet: PFdmrD8R0RyJIDJr1j9q6jAbv67Xdd1dt8tx3fee02am
+
+This wallet has full platform control:
+- Initialize GlobalConfig (factory program)
+- Update all platform parameters
+- Create/end seasons (rewards program)
+- Withdraw from Platform Treasury
+- Access Admin Dashboard (/admin)
 
 ## What's Been Created
 
