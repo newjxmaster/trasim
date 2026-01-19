@@ -1,6 +1,4 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { Program, AnchorProvider } from '@coral-xyz/anchor';
-import { Idl } from '@coral-xyz/anchor/target/types';
 import pg from 'pg';
 import dotenv from 'dotenv';
 
@@ -9,7 +7,7 @@ dotenv.config();
 const { Pool } = pg;
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/trasim',
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@127.0.0.1:54342/postgres',
 });
 
 const connection = new Connection(
@@ -23,7 +21,7 @@ const PROGRAM_IDS: { [key: string]: PublicKey } = {
   rewards: new PublicKey('3DvyQntgVJWCF77LJcFe2LvjoG7mKnEpfjjzk3KtVH3B'),
 };
 
-async function handleTradeEvent(event: any) {
+async function handleTradeEvent(event: any, signature: string) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -35,7 +33,7 @@ async function handleTradeEvent(event: any) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (signature) DO NOTHING`,
       [
-        event.signature,
+        signature,
         event.slot,
         new Date(event.ts * 1000).toISOString(),
         event.market,
@@ -51,6 +49,8 @@ async function handleTradeEvent(event: any) {
       ]
     );
 
+    await updateMarketSnapshot(client, event.market);
+
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -61,7 +61,7 @@ async function handleTradeEvent(event: any) {
   }
 }
 
-async function handleMarketCreatedEvent(event: any) {
+async function handleMarketCreatedEvent(event: any, signature: string) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -104,29 +104,252 @@ async function handleMarketCreatedEvent(event: any) {
   }
 }
 
-async function processLogs(slot: number, signature: string, logs: string[]) {
-  console.log(`Processing slot ${slot}, tx ${signature}`);
+async function handleSeasonCreatedEvent(event: any, signature: string) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO seasons (season_id, start_ts, end_ts, params_json, reward_pool_lamports, status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (season_id) DO NOTHING`,
+      [
+        event.seasonId,
+        new Date(event.startTs * 1000).toISOString(),
+        new Date(event.endTs * 1000).toISOString(),
+        JSON.stringify(event.params || {}),
+        0,
+        'active',
+      ]
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error handling season created event:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
+
+async function handleSeasonEndedEvent(event: any, signature: string) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE seasons
+       SET status = 'ended'
+       WHERE season_id = $1`,
+      [event.seasonId]
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error handling season ended event:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function handleAdminActionEvent(event: any, signature: string) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO admin_actions (admin_wallet, action_type, payload, tx_sig)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        event.adminWallet || 'unknown',
+        event.actionType || 'unknown',
+        JSON.stringify(event.payload || {}),
+        signature,
+      ]
+    );
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error handling admin action event:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function updateMarketSnapshot(client: any, marketId: string) {
+  try {
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+    const result = await client.query(
+      `SELECT 
+        COALESCE(SUM(CASE WHEN side = 0 THEN sol_net_lamports ELSE -sol_net_lamports END), 0) as volume_24h_lamports,
+        COUNT(DISTINCT wallet) as holders_count
+       FROM trades
+       WHERE market_id = $1 AND ts >= $2`,
+      [marketId, yesterday.toISOString()]
+    );
+
+    const { volume_24h_lamports, holders_count } = result.rows[0];
+
+    const latestTrade = await client.query(
+      `SELECT post_supply, post_price_lamports
+       FROM trades
+       WHERE market_id = $1
+       ORDER BY ts DESC
+       LIMIT 1`,
+      [marketId]
+    );
+
+    let supply = 0;
+    let priceLamports = 0;
+
+    if (latestTrade.rows.length > 0) {
+      supply = latestTrade.rows[0].post_supply;
+      priceLamports = latestTrade.rows[0].post_price_lamports;
+    }
+
+    await client.query(
+      `INSERT INTO market_snapshots (market_id, slot, ts, supply, price_lamports, 
+                                     exit_reserve_lamports, volume_24h_lamports, holders_count)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        marketId,
+        0,
+        now.toISOString(),
+        supply,
+        priceLamports,
+        supply * 1_000_000_000,
+        volume_24h_lamports || 0,
+        holders_count || 0,
+      ]
+    );
+  } catch (error) {
+    console.error('Error updating market snapshot:', error);
+  }
+}
+
+function parseAnchorEvent(log: string): any {
+  if (!log.includes('Program data:')) {
+    return null;
+  }
+
+  const match = log.match(/Program data: (.+)/);
+  if (!match) {
+    return null;
+  }
+
+  const eventStr = match[1];
+  console.log('Parsing event:', eventStr);
+
+  try {
+    const data = JSON.parse(eventStr);
+    return data;
+  } catch (error) {
+    console.error('Error parsing event JSON:', error);
+    return null;
+  }
+}
+
+let isRunning = true;
 
 async function startIndexer() {
-  console.log('Starting indexer...');
+  console.log('Starting TRASIM Indexer...');
   console.log('Connected to RPC:', connection.rpcEndpoint);
+  console.log('Database:', pool.options.connectionString);
+  console.log('\nMonitoring programs:');
+  console.log('  - Factory:', PROGRAM_IDS.factory.toString());
+  console.log('  - Market:', PROGRAM_IDS.market.toString());
+  console.log('  - Rewards:', PROGRAM_IDS.rewards.toString());
+  console.log('\nPress Ctrl+C to stop\n');
 
-  connection.onLogs(
-    Object.values(PROGRAM_IDS),
-    async (logs, context) => {
-      await processLogs(context.slot, context.signature, logs);
+  process.on('SIGINT', () => {
+    console.log('\n🛑 Shutting down indexer gracefully...');
+    isRunning = false;
+    pool.end(() => {
+      console.log('✅ Database connection closed');
+      process.exit(0);
+    });
+  });
+
+  process.on('SIGTERM', () => {
+    console.log('\n🛑 Shutting down indexer gracefully...');
+    isRunning = false;
+    pool.end(() => {
+      console.log('✅ Database connection closed');
+      process.exit(0);
+    });
+  });
+
+  const subscriptionIds: any[] = [];
+
+  for (const programId of Object.values(PROGRAM_IDS)) {
+    try {
+      const subscriptionId = connection.onLogs(
+        programId,
+        'confirmed',
+        async (logs, ctx) => {
+          if (!isRunning) return;
+
+          try {
+            const logArray = (logs as any)?.logs || [];
+            if (!Array.isArray(logArray)) {
+              return;
+            }
+
+            for (const logItem of logArray) {
+              const logStrings = logItem.logs as string[] || [];
+              for (const log of logStrings) {
+                const event = parseAnchorEvent(log);
+                if (!event) continue;
+
+                try {
+                  switch (event.name) {
+                    case 'TradeEvent':
+                      await handleTradeEvent(event, ctx.signature);
+                      break;
+                    case 'MarketCreated':
+                      await handleMarketCreatedEvent(event, ctx.signature);
+                      break;
+                    case 'SeasonCreated':
+                      await handleSeasonCreatedEvent(event, ctx.signature);
+                      break;
+                    case 'SeasonEnded':
+                      await handleSeasonEndedEvent(event, ctx.signature);
+                      break;
+                    case 'ConfigUpdated':
+                    case 'ConfigInitialized':
+                      await handleAdminActionEvent(event, ctx.signature);
+                      break;
+                    default:
+                      console.log('Unknown event type:', event.name);
+                  }
+                } catch (error) {
+                  console.error(`Error processing event ${event.name}:`, error);
+                }
+              }
+            }
+          } catch (error) {
+            console.error('Error processing logs:', error);
+          }
+        }
+      );
+      subscriptionIds.push(subscriptionId);
+      console.log(`✅ Subscribed to logs for ${programId.toString()}`);
+    } catch (error) {
+      console.error(`Failed to subscribe to ${programId.toString()}:`, error);
     }
-  );
+  }
 
-  connection.onAccountChange(
-    Object.values(PROGRAM_IDS),
-    async (accountInfo, context) => {
-      console.log('Account changed:', context.accountId.toString());
-    }
-  );
-
-  console.log('Indexer listening for events...');
+  console.log(`\n✅ Indexer listening for events (${subscriptionIds.length} subscriptions)`);
 }
 
-startIndexer().catch(console.error);
+startIndexer().catch((error) => {
+  console.error('Fatal error starting indexer:', error);
+  process.exit(1);
+});
